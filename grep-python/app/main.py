@@ -7,6 +7,17 @@ import sys
 def match_pattern(input_line, pattern):
     if len(pattern) == 1:
         return pattern in input_line
+    if pattern == "\\w":
+        return any(char.isalnum() or char == "_" for char in input_line)
+    if pattern == "\\d":
+        return any(char.isdigit() for char in input_line)
+    if pattern.startswith("[") and pattern.endswith("]"):
+        pattern = pattern[1:-1]
+        if pattern.startswith("^"):
+            excluded = pattern[1:]
+            return any(char not in excluded for char in input_line)
+        return any(char in pattern for char in input_line)
+
     raise RuntimeError(f"Unhandled pattern: {pattern}")
 
 
