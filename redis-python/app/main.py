@@ -9,18 +9,24 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Callable
 
+
 @dataclass
 class ServerConfig:
     port: int = 6379
     replicaof: tuple[str, int] | None = None
     master_replid: str = field(default_factory=lambda: secrets.token_hex(20))
     master_repl_offset: int = 0
-    dir: str = ""
+    dir: str = field(default_factory=os.getcwd)
     dbfilename: str = ""
+    appendonly: str = "no"
+    appenddirname: str = "appendonlydir"
+    appendfilename: str = "appendonly.aof"
+    appendfsync: str = "everysec"
 
     @property
     def role(self) -> str:
         return "slave" if self.replicaof else "master"
+
 
 config = ServerConfig()
 
@@ -149,7 +155,7 @@ def parse_resp(msg: bytes) -> list[str] | None:
             args.append(lines[i].decode())
             i += 1
         return args
-    except (IndexError, ValueError):
+    except IndexError, ValueError:
         return None
 
 
@@ -290,14 +296,26 @@ def cmd_keys(args: list[str]) -> bytes:
 def cmd_config_get(args: list[str]) -> bytes:
     if len(args) < 3:
         return b"-ERR wrong number of arguments for 'config|get' command\r\n"
+
     param = args[2].lower()
     result = []
+
+    # Check against all supported configuration parameters
     if param == "dir":
         result = ["dir", config.dir]
     elif param == "dbfilename":
         result = ["dbfilename", config.dbfilename]
+    elif param == "appendonly":
+        result = ["appendonly", config.appendonly]
+    elif param == "appenddirname":
+        result = ["appenddirname", config.appenddirname]
+    elif param == "appendfilename":
+        result = ["appendfilename", config.appendfilename]
+    elif param == "appendfsync":
+        result = ["appendfsync", config.appendfsync]
     elif param == "save":
         result = ["save", ""]
+
     if result:
         return encode_array(result)
     return b"*0\r\n"
@@ -603,7 +621,7 @@ async def cmd_blpop(args: list[str], writer: asyncio.StreamWriter) -> None:
 async def cmd_xread_block(args: list[str], writer: asyncio.StreamWriter) -> None:
     try:
         timeout_ms = float(args[2])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         writer.write(b"-ERR timeout is not a float or out of range\r\n")
         return
     streams_idx = next((i for i, a in enumerate(args) if a.upper() == "STREAMS"), None)
@@ -659,7 +677,7 @@ async def cmd_wait(args: list[str], writer: asyncio.StreamWriter) -> None:
     try:
         numreplicas = int(args[1])
         timeout_ms = int(args[2])
-    except (IndexError, ValueError):
+    except IndexError, ValueError:
         writer.write(b"-ERR syntax error\r\n")
         return
 
@@ -858,7 +876,11 @@ async def _replica_read_loop(reader: asyncio.StreamReader, leftover: bytes) -> N
             pos += arg_len + 2
         global _replica_offset, _master_writer
         cmd_bytes = pos
-        if len(args) >= 2 and args[0].lower() == "replconf" and args[1].lower() == "getack":
+        if (
+            len(args) >= 2
+            and args[0].lower() == "replconf"
+            and args[1].lower() == "getack"
+        ):
             response = encode_array(["REPLCONF", "ACK", str(_replica_offset)])
             if _master_writer:
                 _master_writer.write(response)
@@ -918,7 +940,7 @@ async def _replica_psync_loop(reader: asyncio.StreamReader, replica_idx: int) ->
                 idx = buf.find(b"\r\n")
                 if idx == -1:
                     break
-                buf = buf[idx + 2:]
+                buf = buf[idx + 2 :]
                 continue
             crlf = buf.find(b"\r\n")
             if crlf == -1:
@@ -926,7 +948,7 @@ async def _replica_psync_loop(reader: asyncio.StreamReader, replica_idx: int) ->
             try:
                 num_args = int(buf[1:crlf])
             except ValueError:
-                buf = buf[crlf + 2:]
+                buf = buf[crlf + 2 :]
                 continue
             pos = crlf + 2
             args = []
@@ -936,7 +958,7 @@ async def _replica_psync_loop(reader: asyncio.StreamReader, replica_idx: int) ->
                 if crlf2 == -1:
                     ok = False
                     break
-                if pos >= len(buf) or buf[pos:pos+1] != b"$":
+                if pos >= len(buf) or buf[pos : pos + 1] != b"$":
                     ok = False
                     break
                 try:
@@ -953,9 +975,11 @@ async def _replica_psync_loop(reader: asyncio.StreamReader, replica_idx: int) ->
             if not ok:
                 break
             buf = buf[pos:]
-            if (len(args) >= 3
-                    and args[0].upper() == "REPLCONF"
-                    and args[1].upper() == "ACK"):
+            if (
+                len(args) >= 3
+                and args[0].upper() == "REPLCONF"
+                and args[1].upper() == "ACK"
+            ):
                 try:
                     ack_offset = int(args[2])
                     if replica_idx < len(replica_ack_offsets):
@@ -1031,12 +1055,14 @@ async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=6379)
     parser.add_argument("--replicaof", type=str, default=None)
-    parser.add_argument("--dir", type=str, default="")
-    parser.add_argument("--dbfilename", type=str, default="")
+    parser.add_argument("--dir", type=str, default=None)  # ← was default=""
+    parser.add_argument("--dbfilename", type=str, default=None)  # ← was default=""
     cli_args = parser.parse_args()
     config.port = cli_args.port
-    config.dir = cli_args.dir
-    config.dbfilename = cli_args.dbfilename
+    if cli_args.dir is not None:  # ← only override if explicitly provided
+        config.dir = cli_args.dir
+    if cli_args.dbfilename is not None:  # ← same for dbfilename
+        config.dbfilename = cli_args.dbfilename
     if cli_args.replicaof:
         host, port = cli_args.replicaof.split()
         config.replicaof = (host, int(port))
