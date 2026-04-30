@@ -1,13 +1,13 @@
 import argparse
 import asyncio
+import base64
+import os
 import secrets
+import struct
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Callable
-
-# ── Config ────────────────────────────────────────────────────────────────────
-
 
 @dataclass
 class ServerConfig:
@@ -15,15 +15,25 @@ class ServerConfig:
     replicaof: tuple[str, int] | None = None
     master_replid: str = field(default_factory=lambda: secrets.token_hex(20))
     master_repl_offset: int = 0
+    dir: str = ""
+    dbfilename: str = ""
 
     @property
     def role(self) -> str:
         return "slave" if self.replicaof else "master"
 
-
 config = ServerConfig()
 
-# ── Store & dirty tracking ────────────────────────────────────────────────────
+replica_writers: list[asyncio.StreamWriter] = []
+replica_readers: list[asyncio.StreamReader] = []
+replica_ack_offsets: list[int] = []
+
+EMPTY_RDB = base64.b64decode(
+    "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXC"
+    "bQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog=="
+)
+
+master_repl_offset: int = 0
 
 StreamEntry = tuple[str, list[str]]
 store: dict[str, tuple[str | list[str] | list[StreamEntry], float | None]] = {}
@@ -37,7 +47,92 @@ def mark_dirty(key: str) -> None:
     dirty_keys[key] = dirty_keys.get(key, 0) + 1
 
 
-# ── RESP helpers ──────────────────────────────────────────────────────────────
+def rdb_read_length(data: bytes, pos: int) -> tuple[int | None, int]:
+    """Return (length, new_pos). length is None for special encodings (enc_type==3)."""
+    b = data[pos]
+    enc_type = (b & 0xC0) >> 6
+    if enc_type == 0:
+        return b & 0x3F, pos + 1
+    elif enc_type == 1:
+        return ((b & 0x3F) << 8) | data[pos + 1], pos + 2
+    elif enc_type == 2:
+        return struct.unpack(">I", data[pos + 1 : pos + 5])[0], pos + 5
+    else:  # enc_type == 3: special encoding; return None + subtype in lower 6 bits
+        return None, pos + 1  # caller uses data[pos-1] & 0x3F for subtype
+
+
+def rdb_special_subtype(data: bytes, pos: int) -> int:
+    """Return the special-encoding subtype from the byte just before pos."""
+    return data[pos - 1] & 0x3F
+
+
+def rdb_read_string(data: bytes, pos: int) -> tuple[str, int]:
+    length, pos = rdb_read_length(data, pos)
+    if length is not None:
+        return data[pos : pos + length].decode("utf-8", errors="replace"), pos + length
+    # Special encoding — subtype is in lower 6 bits of the byte we just consumed
+    subtype = data[pos - 1] & 0x3F
+    if subtype == 0:  # 8-bit integer
+        return str(data[pos]), pos + 1
+    elif subtype == 1:  # 16-bit integer LE
+        return str(struct.unpack("<H", data[pos : pos + 2])[0]), pos + 2
+    elif subtype == 2:  # 32-bit integer LE
+        return str(struct.unpack("<I", data[pos : pos + 4])[0]), pos + 4
+    elif subtype == 3:  # LZF compressed string
+        clen, pos = rdb_read_length(data, pos)
+        ulen, pos = rdb_read_length(data, pos)
+        raw = data[pos : pos + clen]
+        return raw.decode("utf-8", errors="replace"), pos + clen
+    else:
+        raise ValueError(f"Unsupported string encoding subtype: {subtype}")
+
+
+def load_rdb() -> None:
+    if not config.dir or not config.dbfilename:
+        return
+    path = os.path.join(config.dir, config.dbfilename)
+    if not os.path.exists(path):
+        return
+    with open(path, "rb") as f:
+        data = f.read()
+    pos = 9
+    while pos < len(data):
+        marker = data[pos]
+        pos += 1
+        if marker == 0xFA:
+            _, pos = rdb_read_string(data, pos)
+            _, pos = rdb_read_string(data, pos)
+        elif marker == 0xFE:
+            _, pos = rdb_read_length(data, pos)
+        elif marker == 0xFB:
+            _, pos = rdb_read_length(data, pos)
+            _, pos = rdb_read_length(data, pos)
+        elif marker == 0xFF:
+            break
+        else:
+            expiry: float | None = None
+            if marker == 0xFC:
+                ms = struct.unpack("<Q", data[pos : pos + 8])[0]
+                expiry = ms / 1000.0
+                pos += 8
+                value_type = data[pos]
+                pos += 1
+            elif marker == 0xFD:
+                secs = struct.unpack("<I", data[pos : pos + 4])[0]
+                expiry = float(secs)
+                pos += 4
+                value_type = data[pos]
+                pos += 1
+            else:
+                value_type = marker
+            key, pos = rdb_read_string(data, pos)
+            if value_type == 0:
+                value, pos = rdb_read_string(data, pos)
+                if expiry is not None and time.time() > expiry:
+                    continue
+                store[key] = (value, expiry)
+            else:
+                break
 
 
 def parse_resp(msg: bytes) -> list[str] | None:
@@ -54,7 +149,7 @@ def parse_resp(msg: bytes) -> list[str] | None:
             args.append(lines[i].decode())
             i += 1
         return args
-    except IndexError, ValueError:
+    except (IndexError, ValueError):
         return None
 
 
@@ -87,7 +182,24 @@ def encode_stream_entries(entries: list[StreamEntry]) -> bytes:
     return result
 
 
-# ── Store helpers ─────────────────────────────────────────────────────────────
+WRITE_COMMANDS = {"SET", "DEL", "INCR", "RPUSH", "LPUSH", "LPOP", "XADD"}
+
+
+async def propagate(args: list[str]) -> None:
+    global master_repl_offset
+    if not replica_writers:
+        return
+    data = encode_array(args)
+    master_repl_offset += len(data)
+    for w in list(replica_writers):
+        try:
+            w.write(data)
+            await w.drain()
+        except Exception:
+            idx = replica_writers.index(w)
+            replica_writers.pop(idx)
+            replica_readers.pop(idx)
+            replica_ack_offsets.pop(idx)
 
 
 def get_store_value(key: str) -> str | list[str] | list[StreamEntry] | None:
@@ -118,9 +230,6 @@ def parse_entry_id_range(entry_id: str, default_seq: int) -> tuple[int, int]:
         ms, seq = entry_id.split("-", 1)
         return int(ms), int(seq)
     return int(entry_id), default_seq
-
-
-# ── Command handlers ──────────────────────────────────────────────────────────
 
 
 def cmd_ping(args: list[str]) -> bytes:
@@ -168,6 +277,30 @@ def cmd_get(args: list[str]) -> bytes:
     if not isinstance(value, str):
         return b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
     return encode_bulk_string(value)
+
+
+def cmd_keys(args: list[str]) -> bytes:
+    if len(args) < 2:
+        return b"-ERR wrong number of arguments for 'keys' command\r\n"
+    now = time.time()
+    keys = [k for k, (v, exp) in store.items() if exp is None or exp > now]
+    return encode_array(keys)
+
+
+def cmd_config_get(args: list[str]) -> bytes:
+    if len(args) < 3:
+        return b"-ERR wrong number of arguments for 'config|get' command\r\n"
+    param = args[2].lower()
+    result = []
+    if param == "dir":
+        result = ["dir", config.dir]
+    elif param == "dbfilename":
+        result = ["dbfilename", config.dbfilename]
+    elif param == "save":
+        result = ["save", ""]
+    if result:
+        return encode_array(result)
+    return b"*0\r\n"
 
 
 def cmd_incr(args: list[str]) -> bytes:
@@ -422,9 +555,6 @@ def cmd_info(args: list[str]) -> bytes:
     return encode_bulk_string("")
 
 
-# ── Waiter helpers ────────────────────────────────────────────────────────────
-
-
 def notify_waiter(key: str) -> None:
     if waiters[key]:
         waiters[key][0].put_nowait(key)
@@ -433,9 +563,6 @@ def notify_waiter(key: str) -> None:
 def notify_stream_waiters(key: str) -> None:
     for q in stream_waiters[key]:
         q.put_nowait(key)
-
-
-# ── Async command handlers ────────────────────────────────────────────────────
 
 
 async def cmd_blpop(args: list[str], writer: asyncio.StreamWriter) -> None:
@@ -476,7 +603,7 @@ async def cmd_blpop(args: list[str], writer: asyncio.StreamWriter) -> None:
 async def cmd_xread_block(args: list[str], writer: asyncio.StreamWriter) -> None:
     try:
         timeout_ms = float(args[2])
-    except ValueError, IndexError:
+    except (ValueError, IndexError):
         writer.write(b"-ERR timeout is not a float or out of range\r\n")
         return
     streams_idx = next((i for i, a in enumerate(args) if a.upper() == "STREAMS"), None)
@@ -518,7 +645,61 @@ async def cmd_xread_block(args: list[str], writer: asyncio.StreamWriter) -> None
             stream_waiters[key].remove(q)
 
 
-# ── Transaction & connection state ────────────────────────────────────────────
+_ack_event: asyncio.Event | None = None
+
+
+def get_ack_event() -> asyncio.Event:
+    global _ack_event
+    if _ack_event is None:
+        _ack_event = asyncio.Event()
+    return _ack_event
+
+
+async def cmd_wait(args: list[str], writer: asyncio.StreamWriter) -> None:
+    try:
+        numreplicas = int(args[1])
+        timeout_ms = int(args[2])
+    except (IndexError, ValueError):
+        writer.write(b"-ERR syntax error\r\n")
+        return
+
+    n = len(replica_writers)
+    if n == 0:
+        writer.write(encode_int(0))
+        return
+
+    if master_repl_offset == 0:
+        writer.write(encode_int(n))
+        return
+
+    getack = encode_array(["REPLCONF", "GETACK", "*"])
+    for w in list(replica_writers):
+        try:
+            w.write(getack)
+            await w.drain()
+        except Exception:
+            pass
+
+    deadline = asyncio.get_event_loop().time() + (timeout_ms / 1000)
+
+    def count_acked() -> int:
+        return sum(1 for off in replica_ack_offsets if off >= master_repl_offset)
+
+    event = get_ack_event()
+    while True:
+        acked = count_acked()
+        if acked >= numreplicas:
+            break
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            break
+        event.clear()
+        try:
+            await asyncio.wait_for(asyncio.shield(event.wait()), timeout=remaining)
+        except asyncio.TimeoutError:
+            break
+
+    writer.write(encode_int(count_acked()))
 
 
 @dataclass
@@ -557,8 +738,7 @@ class ConnectionState:
         if self.tx is not None:
             self.tx.watched_keys.clear()
             self.tx.dirty_snapshot.clear()
-
-        return b"+OK\r\n"  # always OK, even if nothing was watched
+        return b"+OK\r\n"
 
     def multi(self) -> bytes:
         if self.in_multi:
@@ -590,35 +770,29 @@ class ConnectionState:
         return b"+OK\r\n"
 
 
-# ── Command registry ──────────────────────────────────────────────────────────
-
-
 @dataclass
 class Command:
     handler: Callable[[ConnectionState, list[str]], bytes]
-    always: bool = False  # if True, bypasses transaction queue
+    always: bool = False
 
 
 def _s(
     fn: Callable[[list[str]], bytes],
 ) -> Callable[[ConnectionState, list[str]], bytes]:
-    """Wrap a stateless handler to fit the (state, args) signature."""
     return lambda state, args: fn(args)
 
 
 ALL_COMMANDS: dict[str, Command] = {
-    # Transaction control — always run immediately
     "EXEC": Command(lambda state, args: state.exec(), always=True),
     "DISCARD": Command(lambda state, args: state.discard(), always=True),
-    # Connection state commands — queued inside MULTI, run outside
     "WATCH": Command(lambda state, args: state.watch(args[1:]), always=True),
     "UNWATCH": Command(lambda state, args: state.unwatch(), always=True),
     "MULTI": Command(lambda state, args: state.multi()),
-    # Regular stateless commands
     "PING": Command(_s(cmd_ping)),
     "ECHO": Command(_s(cmd_echo)),
     "SET": Command(_s(cmd_set)),
     "GET": Command(_s(cmd_get)),
+    "KEYS": Command(_s(cmd_keys)),
     "INCR": Command(_s(cmd_incr)),
     "RPUSH": Command(_s(cmd_rpush)),
     "LPUSH": Command(_s(cmd_lpush)),
@@ -630,23 +804,169 @@ ALL_COMMANDS: dict[str, Command] = {
     "XRANGE": Command(_s(cmd_xrange)),
     "XREAD": Command(_s(cmd_xread)),
     "INFO": Command(_s(cmd_info)),
+    "REPLCONF": Command(_s(lambda args: b"+OK\r\n")),
 }
 
 
 def dispatch_sync(args: list[str]) -> bytes:
-    """Dispatch a command without connection state (used inside EXEC)."""
     entry = ALL_COMMANDS.get(args[0].upper())
     if entry is None:
         return b"-ERR unknown command\r\n"
     return entry.handler(ConnectionState(), args)
 
 
-# ── Networking ────────────────────────────────────────────────────────────────
+_replication_task: asyncio.Task | None = None
+_master_writer: asyncio.StreamWriter | None = None
+_replica_offset: int = 0
+
+
+async def _replica_read_loop(reader: asyncio.StreamReader, leftover: bytes) -> None:
+    buf = leftover
+    while True:
+        if not buf:
+            chunk = await reader.read(4096)
+            if not chunk:
+                break
+            buf += chunk
+        if not buf.startswith(b"*"):
+            break
+        crlf = buf.find(b"\r\n")
+        if crlf == -1:
+            chunk = await reader.read(4096)
+            if not chunk:
+                break
+            buf += chunk
+            continue
+        num_args = int(buf[1:crlf])
+        pos = crlf + 2
+        args = []
+        for _ in range(num_args):
+            while buf.find(b"\r\n", pos) == -1:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    return
+                buf += chunk
+            crlf2 = buf.find(b"\r\n", pos)
+            arg_len = int(buf[pos + 1 : crlf2])
+            pos = crlf2 + 2
+            while len(buf) < pos + arg_len + 2:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    return
+                buf += chunk
+            args.append(buf[pos : pos + arg_len].decode())
+            pos += arg_len + 2
+        global _replica_offset, _master_writer
+        cmd_bytes = pos
+        if len(args) >= 2 and args[0].lower() == "replconf" and args[1].lower() == "getack":
+            response = encode_array(["REPLCONF", "ACK", str(_replica_offset)])
+            if _master_writer:
+                _master_writer.write(response)
+                await _master_writer.drain()
+        else:
+            dispatch_sync(args)
+        _replica_offset += cmd_bytes
+        buf = buf[pos:]
+
+
+async def replica_handshake() -> None:
+    global _replication_task, _master_writer
+    assert config.replicaof is not None
+    host, port = config.replicaof
+    reader, writer = await asyncio.open_connection(host, port)
+    writer.write(encode_array(["PING"]))
+    await writer.drain()
+    await reader.read(1024)
+    writer.write(encode_array(["REPLCONF", "listening-port", str(config.port)]))
+    await writer.drain()
+    await reader.read(1024)
+    writer.write(encode_array(["REPLCONF", "capa", "psync2"]))
+    await writer.drain()
+    await reader.read(1024)
+    writer.write(encode_array(["PSYNC", "?", "-1"]))
+    await writer.drain()
+    buf = b""
+    while True:
+        buf += await reader.read(4096)
+        if b"$" not in buf:
+            continue
+        dollar = buf.index(b"$")
+        crlf = buf.find(b"\r\n", dollar)
+        if crlf == -1:
+            continue
+        rdb_len = int(buf[dollar + 1 : crlf])
+        rdb_start = crlf + 2
+        if len(buf) >= rdb_start + rdb_len:
+            buf = buf[rdb_start + rdb_len :]
+            break
+    _master_writer = writer
+    _replication_task = asyncio.create_task(_replica_read_loop(reader, buf))
+
+
+async def _replica_psync_loop(reader: asyncio.StreamReader, replica_idx: int) -> None:
+    buf = b""
+    while True:
+        try:
+            chunk = await reader.read(4096)
+        except Exception:
+            break
+        if not chunk:
+            break
+        buf += chunk
+        while buf:
+            if not buf.startswith(b"*"):
+                idx = buf.find(b"\r\n")
+                if idx == -1:
+                    break
+                buf = buf[idx + 2:]
+                continue
+            crlf = buf.find(b"\r\n")
+            if crlf == -1:
+                break
+            try:
+                num_args = int(buf[1:crlf])
+            except ValueError:
+                buf = buf[crlf + 2:]
+                continue
+            pos = crlf + 2
+            args = []
+            ok = True
+            for _ in range(num_args):
+                crlf2 = buf.find(b"\r\n", pos)
+                if crlf2 == -1:
+                    ok = False
+                    break
+                if pos >= len(buf) or buf[pos:pos+1] != b"$":
+                    ok = False
+                    break
+                try:
+                    arg_len = int(buf[pos + 1 : crlf2])
+                except ValueError:
+                    ok = False
+                    break
+                pos = crlf2 + 2
+                if len(buf) < pos + arg_len + 2:
+                    ok = False
+                    break
+                args.append(buf[pos : pos + arg_len].decode())
+                pos += arg_len + 2
+            if not ok:
+                break
+            buf = buf[pos:]
+            if (len(args) >= 3
+                    and args[0].upper() == "REPLCONF"
+                    and args[1].upper() == "ACK"):
+                try:
+                    ack_offset = int(args[2])
+                    if replica_idx < len(replica_ack_offsets):
+                        replica_ack_offsets[replica_idx] = ack_offset
+                        get_ack_event().set()
+                except ValueError:
+                    pass
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     state = ConnectionState()
-
     try:
         while True:
             msg = await reader.read(1024)
@@ -657,10 +977,30 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 writer.write(b"-ERR invalid input\r\n")
                 await writer.drain()
                 continue
-
             cmd = args[0].upper()
-
-            if cmd == "BLPOP":
+            if cmd == "PSYNC":
+                fullresync = f"+FULLRESYNC {config.master_replid} 0\r\n".encode()
+                rdb = b"$" + str(len(EMPTY_RDB)).encode() + b"\r\n" + EMPTY_RDB
+                writer.write(fullresync + rdb)
+                await writer.drain()
+                replica_idx = len(replica_writers)
+                replica_writers.append(writer)
+                replica_readers.append(reader)
+                replica_ack_offsets.append(0)
+                await _replica_psync_loop(reader, replica_idx)
+                try:
+                    idx = replica_writers.index(writer)
+                    replica_writers.pop(idx)
+                    replica_readers.pop(idx)
+                    replica_ack_offsets.pop(idx)
+                except ValueError:
+                    pass
+                return
+            elif cmd == "WAIT":
+                await cmd_wait(args, writer)
+            elif cmd == "CONFIG" and len(args) >= 2 and args[1].upper() == "GET":
+                writer.write(cmd_config_get(args))
+            elif cmd == "BLPOP":
                 await cmd_blpop(args, writer)
             elif cmd == "XREAD" and len(args) > 2 and args[1].upper() == "BLOCK":
                 await cmd_xread_block(args, writer)
@@ -672,12 +1012,17 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     writer.write(state.queue_cmd(args))
                 else:
                     writer.write(entry.handler(state, args))
-
+                    if cmd in WRITE_COMMANDS and replica_writers:
+                        await propagate(args)
             await writer.drain()
-
     except ConnectionResetError:
-        print("Client disconnected")
+        pass
     finally:
+        if writer in replica_writers:
+            idx = replica_writers.index(writer)
+            replica_writers.pop(idx)
+            replica_readers.pop(idx)
+            replica_ack_offsets.pop(idx)
         writer.close()
         await writer.wait_closed()
 
@@ -686,22 +1031,24 @@ async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=6379)
     parser.add_argument("--replicaof", type=str, default=None)
+    parser.add_argument("--dir", type=str, default="")
+    parser.add_argument("--dbfilename", type=str, default="")
     cli_args = parser.parse_args()
-
     config.port = cli_args.port
+    config.dir = cli_args.dir
+    config.dbfilename = cli_args.dbfilename
     if cli_args.replicaof:
         host, port = cli_args.replicaof.split()
         config.replicaof = (host, int(port))
-
-    print("Logs from your program will appear here!")
+    load_rdb()
+    if config.replicaof:
+        await replica_handshake()
     server = await asyncio.start_server(
         handle_client, host="localhost", port=config.port, reuse_port=True
     )
-    print(f"Serving on {server.sockets[0].getsockname()}")
     async with server:
         await server.serve_forever()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
